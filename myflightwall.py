@@ -9,6 +9,8 @@ import http.server
 import socketserver
 from FlightRadar24 import FlightRadar24API
 from datetime import datetime
+from urllib.parse import urlparse, parse_qs
+import json
 
 # --- CONFIGURATION ---
 #
@@ -40,6 +42,159 @@ HUB_NAME = "Chromecast"
 known_flights = set()
 fr_api = FlightRadar24API()
 
+# --- CONFIGURATION PARSERS, LOCKS, & HISTORY ---
+def parse_active_hours(val):
+    """Parses a string formatted as 'HH:MM,HH:MM' into a tuple of two strings."""
+    parts = val.split(',')
+    if len(parts) == 2:
+        # validate HH:MM formats
+        datetime.strptime(parts[0].strip(), "%H:%M")
+        datetime.strptime(parts[1].strip(), "%H:%M")
+        return (parts[0].strip(), parts[1].strip())
+    raise ValueError("ACTIVE_HOURS must be in the format 'HH:MM,HH:MM'")
+
+CONFIG_PARSERS = {
+    "HOME_LAT": float,
+    "HOME_LON": float,
+    "RADAR_RADIUS_METERS": int,
+    "ACTIVE_HOURS": parse_active_hours,
+    "CAST_DURATION_SECONDS": int,
+    "PUSHOVER_USER_KEY": str,
+    "LOCAL_IP": str,
+    "PORT": int,
+    "HUB_NAME": str,
+}
+
+data_lock = threading.Lock()
+detected_flights_history = []
+
+
+class FlightWallRequestHandler(http.server.SimpleHTTPRequestHandler):
+    """Custom HTTP request handler serving local assets and endpoints /configure and /detected."""
+    
+    def do_GET(self):
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
+        query_params = parse_qs(parsed_url.query)
+        
+        if path == '/configure':
+            self.handle_configure(query_params)
+        elif path == '/detected':
+            self.handle_detected(query_params)
+        else:
+            super().do_GET()
+
+    def handle_configure(self, query_params):
+        if not query_params:
+            self.send_response(400)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            response = {
+                "status": "error",
+                "message": "No configuration parameters provided."
+            }
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            return
+
+        updated_params = {}
+        errors = []
+        
+        with data_lock:
+            for key, vals in query_params.items():
+                if key in CONFIG_PARSERS:
+                    val = vals[-1]
+                    try:
+                        parsed_val = CONFIG_PARSERS[key](val)
+                        globals()[key] = parsed_val
+                        updated_params[key] = parsed_val
+                    except Exception as e:
+                        errors.append(f"Invalid value for {key}: {str(e)}")
+                else:
+                    errors.append(f"Unknown configuration parameter: {key}")
+            
+            if errors:
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                response = {
+                    "status": "error",
+                    "message": "; ".join(errors)
+                }
+                self.wfile.write(json.dumps(response).encode('utf-8'))
+                return
+
+            # Prepare current config for response
+            current_config = {}
+            for key in CONFIG_PARSERS:
+                current_config[key] = globals().get(key)
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        response = {
+            "status": "success",
+            "updated_parameters": updated_params,
+            "current_configuration": current_config
+        }
+        self.wfile.write(json.dumps(response).encode('utf-8'))
+
+    def handle_detected(self, query_params):
+        minutes_list = query_params.get("MINUTES") or query_params.get("minutes")
+        if not minutes_list:
+            self.send_response(400)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            response = {
+                "status": "error",
+                "message": "Missing MINUTES parameter."
+            }
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            return
+            
+        minutes_str = minutes_list[-1]
+        try:
+            minutes = int(minutes_str)
+            if minutes <= 0:
+                raise ValueError("MINUTES must be a positive integer.")
+        except ValueError as e:
+            self.send_response(400)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            response = {
+                "status": "error",
+                "message": f"Invalid MINUTES parameter: {str(e)}"
+            }
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            return
+
+        # limit to 1 week (7 * 24 * 60 = 10080 minutes)
+        if minutes > 10080:
+            minutes = 10080
+            
+        now_epoch = time.time()
+        cutoff = now_epoch - minutes * 60
+        
+        with data_lock:
+            # First, clean up history older than 7 days
+            global detected_flights_history
+            seven_days_cutoff = now_epoch - 7 * 24 * 60 * 60
+            detected_flights_history = [f for f in detected_flights_history if f["timestamp_epoch"] >= seven_days_cutoff]
+            
+            # Filter for requested minutes
+            filtered_flights = [f for f in detected_flights_history if f["timestamp_epoch"] >= cutoff]
+            
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        response = {
+            "status": "success",
+            "minutes_requested": minutes,
+            "flights_count": len(filtered_flights),
+            "flights": filtered_flights
+        }
+        self.wfile.write(json.dumps(response).encode('utf-8'))
+
+
 # --- HELPER FUNCTIONS ---
 
 def is_within_active_hours():
@@ -55,7 +210,8 @@ def is_within_active_hours():
 
 def start_local_server():
     """Runs a background web server to serve the image/audio."""
-    Handler = http.server.SimpleHTTPRequestHandler
+    Handler = FlightWallRequestHandler
+    socketserver.TCPServer.allow_reuse_address = True
     httpd = socketserver.TCPServer(("", PORT), Handler)
     httpd.serve_forever()
 
@@ -202,6 +358,31 @@ if __name__ == "__main__":
                     
                     send_android_push(callsign, altitude, origin_iata, dest_iata, ac_type)
                     create_alert_media(callsign, flight.latitude, flight.longitude, altitude, origin_iata, origin_name, dest_iata, dest_name, trail, ac_type, gspeed, vspeed)
+                    
+                    # Log the detected flight in the thread-safe history
+                    detected_flight_info = {
+                        "id": flight.id,
+                        "callsign": callsign,
+                        "altitude": altitude,
+                        "ground_speed": gspeed,
+                        "vertical_speed": vspeed,
+                        "aircraft_type": ac_type,
+                        "latitude": flight.latitude,
+                        "longitude": flight.longitude,
+                        "origin_iata": origin_iata,
+                        "origin_name": origin_name,
+                        "destination_iata": dest_iata,
+                        "destination_name": dest_name,
+                        "timestamp": datetime.now().isoformat(),
+                        "timestamp_epoch": time.time()
+                    }
+                    with data_lock:
+                        now_epoch = time.time()
+                        # prune anything older than 7 days
+                        cutoff = now_epoch - 7 * 24 * 60 * 60
+                        detected_flights_history = [f for f in detected_flights_history if f["timestamp_epoch"] >= cutoff]
+                        detected_flights_history.append(detected_flight_info)
+
                     cast_to_hub()
             
         except Exception as e:
