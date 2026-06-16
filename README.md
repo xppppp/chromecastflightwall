@@ -16,6 +16,33 @@ Inspired by the physical "FlightWall" device, this script monitors the airspace 
 
 ---
 
+### 🌐 Remote Control API
+The built-in local server supports API endpoints to control the radar and query history in real-time without restarting the script.
+
+#### ⚙️ Configuration (`/configure`)
+Dynamically update script settings via GET requests.
+**Example:** `http://<LOCAL_IP>:65530/configure?RADAR_RADIUS_METERS=7000&HOME_LAT=38.89`
+
+**Available Parameters:**
+* `HOME_LAT` / `HOME_LON`: Your home GPS coordinates.
+* `RADAR_RADIUS_METERS`: Detection radius in meters.
+* `ACTIVE_HOURS`: Active window in `HH:MM,HH:MM` format (e.g., `09:00,21:00`).
+* `CAST_DURATION_SECONDS`: How long the image stays on screen.
+* `PUSHOVER_USER_KEY`: Your Pushover user key.
+* `LOCAL_IP`: The IP address of the host machine.
+* `PORT`: The local server port.
+* `HUB_NAME`: The friendly name of your Chromecast.
+
+#### 📜 Detection History (`/detected`)
+Retrieve a JSON list of all flights detected in the past X minutes.
+**Example:** `http://<LOCAL_IP>:65530/detected?MINUTES=60`
+
+**Notes:**
+* The `MINUTES` parameter is required and must be a positive integer.
+* Maximum history retrieval is limited to one week (10,080 minutes).
+
+---
+
 ### 🛠️ Prerequisites
 
 1. **Python 3.x** installed on an always-on machine (like a Raspberry Pi, Mac mini, or home server).
