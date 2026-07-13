@@ -77,21 +77,41 @@ class FlightWallRequestHandler(http.server.SimpleHTTPRequestHandler):
         path = parsed_url.path
         query_params = parse_qs(parsed_url.query)
         
-        if path == '/configure':
+        if path == '/':
+            self.handle_root()
+        elif path == '/configure':
             self.handle_configure(query_params)
         elif path == '/detected':
             self.handle_detected(query_params)
         else:
             super().do_GET()
 
+    def handle_root(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        response = {
+            "endpoints": {
+                "/configure": "Update or retrieve system configuration. Accepts parameters like HOME_LAT, HOME_LON, etc.",
+                "/detected": "Retrieve recently detected flights. Accepts 'MINUTES' parameter (defaults to 60)."
+            }
+        }
+        self.wfile.write(json.dumps(response).encode('utf-8'))
+
     def handle_configure(self, query_params):
         if not query_params:
-            self.send_response(400)
+            # Return current configuration
+            current_config = {}
+            for key in CONFIG_PARSERS:
+                current_config[key] = globals().get(key)
+            
+            self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             response = {
-                "status": "error",
-                "message": "No configuration parameters provided."
+                "status": "success",
+                "message": "Current configuration retrieved.",
+                "current_configuration": current_config
             }
             self.wfile.write(json.dumps(response).encode('utf-8'))
             return
@@ -141,31 +161,25 @@ class FlightWallRequestHandler(http.server.SimpleHTTPRequestHandler):
     def handle_detected(self, query_params):
         minutes_list = query_params.get("MINUTES") or query_params.get("minutes")
         if not minutes_list:
-            self.send_response(400)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            response = {
-                "status": "error",
-                "message": "Missing MINUTES parameter."
-            }
-            self.wfile.write(json.dumps(response).encode('utf-8'))
-            return
-            
-        minutes_str = minutes_list[-1]
-        try:
-            minutes = int(minutes_str)
-            if minutes <= 0:
-                raise ValueError("MINUTES must be a positive integer.")
-        except ValueError as e:
-            self.send_response(400)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            response = {
-                "status": "error",
-                "message": f"Invalid MINUTES parameter: {str(e)}"
-            }
-            self.wfile.write(json.dumps(response).encode('utf-8'))
-            return
+            minutes = 60
+        else:
+            minutes_str = minutes_list[-1]
+            try:
+                minutes = int(minutes_str)
+                if minutes <= 0:
+                    raise ValueError("MINUTES must be a positive integer.")
+            except ValueError as e:
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                response = {
+                    "status": "error",
+                    "message": f"Invalid MINUTES parameter: {str(e)}"
+                }
+                self.wfile.write(json.dumps(response).encode('utf-8'))
+                return
+
+        # limit to 1 week (7 * 24 * 60 = 10080 minutes)
 
         # limit to 1 week (7 * 24 * 60 = 10080 minutes)
         if minutes > 10080:

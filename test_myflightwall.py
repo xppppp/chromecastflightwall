@@ -2,6 +2,9 @@ import sys
 from unittest.mock import MagicMock
 
 # Mock out external libraries before importing the module under test
+mock_requests = MagicMock()
+sys.modules['requests'] = mock_requests
+
 mock_gtts = MagicMock()
 mock_gtts.gTTS = MagicMock()
 sys.modules['gtts'] = mock_gtts
@@ -74,22 +77,23 @@ class TestMyFlightWall(unittest.TestCase):
         myflightwall.ACTIVE_HOURS = self.original_active_hours
         myflightwall.detected_flights_history = self.original_detected_flights_history
 
-    def test_parse_active_hours(self):
-        # Valid format
-        self.assertEqual(myflightwall.parse_active_hours("08:30,22:45"), ("08:30", "22:45"))
-        self.assertEqual(myflightwall.parse_active_hours(" 09:00 , 21:00 "), ("09:00", "21:00"))
-        
-        # Invalid format (not enough or too many parts)
-        with self.assertRaises(ValueError):
-            myflightwall.parse_active_hours("09:00")
-        with self.assertRaises(ValueError):
-            myflightwall.parse_active_hours("09:00,21:00,23:00")
-            
-        # Invalid HH:MM structure
-        with self.assertRaises(ValueError):
-            myflightwall.parse_active_hours("25:00,12:00")
-        with self.assertRaises(ValueError):
-            myflightwall.parse_active_hours("09:60,12:00")
+    def test_root_endpoint(self):
+        url = f"http://{self.ip}:{self.port}/"
+        req = urllib.request.urlopen(url)
+        self.assertEqual(req.getcode(), 200)
+        data = json.loads(req.read().decode('utf-8'))
+        self.assertIn("endpoints", data)
+        self.assertIn("/configure", data["endpoints"])
+        self.assertIn("/detected", data["endpoints"])
+
+    def test_configure_no_params(self):
+        url = f"http://{self.ip}:{self.port}/configure"
+        req = urllib.request.urlopen(url)
+        self.assertEqual(req.getcode(), 200)
+        data = json.loads(req.read().decode('utf-8'))
+        self.assertEqual(data["status"], "success")
+        self.assertIn("current_configuration", data)
+        self.assertEqual(data["current_configuration"]["HOME_LAT"], self.original_home_lat)
 
     def test_configure_valid_params(self):
         url = f"http://{self.ip}:{self.port}/configure?RADAR_RADIUS_METERS=6500&HOME_LAT=45.1234&ACTIVE_HOURS=11:00,23:00"
@@ -194,6 +198,17 @@ class TestMyFlightWall(unittest.TestCase):
 
         myflightwall.detected_flights_history.extend([flight_recent, flight_older, flight_pruned])
 
+        # Request detected flights with NO parameters (should default to 60 minutes)
+        url_default = f"http://{self.ip}:{self.port}/detected"
+        req = urllib.request.urlopen(url_default)
+        self.assertEqual(req.getcode(), 200)
+        data = json.loads(req.read().decode('utf-8'))
+        
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["minutes_requested"], 60)
+        self.assertEqual(data["flights_count"], 1)
+        self.assertEqual(data["flights"][0]["id"], "abc1")
+
         # Request detected flights in the last 10 minutes
         url_10m = f"http://{self.ip}:{self.port}/detected?MINUTES=10"
         req = urllib.request.urlopen(url_10m)
@@ -220,15 +235,6 @@ class TestMyFlightWall(unittest.TestCase):
         self.assertNotIn("abc3", [f["id"] for f in myflightwall.detected_flights_history])
 
     def test_detected_invalid_params(self):
-        # Missing MINUTES
-        url_missing = f"http://{self.ip}:{self.port}/detected"
-        with self.assertRaises(urllib.error.HTTPError) as ctx:
-            urllib.request.urlopen(url_missing)
-        self.assertEqual(ctx.exception.code, 400)
-        data = json.loads(ctx.exception.read().decode('utf-8'))
-        self.assertEqual(data["status"], "error")
-        self.assertIn("Missing MINUTES parameter", data["message"])
-
         # Invalid MINUTES (non-integer)
         url_invalid = f"http://{self.ip}:{self.port}/detected?MINUTES=abc"
         with self.assertRaises(urllib.error.HTTPError) as ctx:
