@@ -19,9 +19,15 @@ Inspired by the physical "FlightWall" device, this script monitors the airspace 
 ### 🌐 Remote Control API
 The built-in local server supports API endpoints to control the radar and query history in real-time without restarting the script.
 
+#### ℹ️ API Info (`/`)
+Retrieve a JSON object describing the available endpoints and their usage.
+**Example:** `http://<LOCAL_IP>:65530/`
+
 #### ⚙️ Configuration (`/configure`)
-Dynamically update script settings via GET requests.
-**Example:** `http://<LOCAL_IP>:65530/configure?RADAR_RADIUS_METERS=7000&HOME_LAT=38.89`
+Dynamically update script settings or retrieve the current configuration via GET requests.
+
+**Retrieve Current Config:** `http://<LOCAL_IP>:65530/configure`
+**Update Settings Example:** `http://<LOCAL_IP>:65530/configure?RADAR_RADIUS_METERS=7000&HOME_LAT=38.89`
 
 **Available Parameters:**
 * `HOME_LAT` / `HOME_LON`: Your home GPS coordinates.
@@ -35,10 +41,10 @@ Dynamically update script settings via GET requests.
 
 #### 📜 Detection History (`/detected`)
 Retrieve a JSON list of all flights detected in the past X minutes.
-**Example:** `http://<LOCAL_IP>:65530/detected?MINUTES=60`
+**Example:** `http://<LOCAL_IP>:65530/detected?MINUTES=120`
 
 **Notes:**
-* The `MINUTES` parameter is required and must be a positive integer.
+* The `MINUTES` parameter is optional and defaults to **60** if not provided.
 * Maximum history retrieval is limited to one week (10,080 minutes).
 
 ---
