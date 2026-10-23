@@ -27,6 +27,7 @@ sys.modules['staticmap'] = mock_staticmap
 mock_fr24 = MagicMock()
 mock_fr24.FlightRadar24API = MagicMock()
 sys.modules['FlightRadar24'] = mock_fr24
+sys.modules['FlightRadarAPI'] = mock_fr24
 
 
 import unittest
@@ -37,6 +38,8 @@ import urllib.request
 import urllib.error
 import json
 import time
+import os
+import tempfile
 from datetime import datetime
 
 # Import the module under test
@@ -52,6 +55,13 @@ class TestMyFlightWall(unittest.TestCase):
         self.original_active_hours = myflightwall.ACTIVE_HOURS
         self.original_detected_flights_history = list(myflightwall.detected_flights_history)
         myflightwall.detected_flights_history.clear()
+
+        # Clean environment variables
+        self.original_env = {}
+        for var in myflightwall.CONFIG_ENV_VARS:
+            self.original_env[var] = os.environ.get(var)
+            if var in os.environ:
+                del os.environ[var]
 
         # Start a local HTTP server on an ephemeral port (port 0) for testing
         class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -76,6 +86,13 @@ class TestMyFlightWall(unittest.TestCase):
         myflightwall.RADAR_RADIUS_METERS = self.original_radar_radius
         myflightwall.ACTIVE_HOURS = self.original_active_hours
         myflightwall.detected_flights_history = self.original_detected_flights_history
+
+        # Restore environment variables
+        for var, val in self.original_env.items():
+            if val is not None:
+                os.environ[var] = val
+            elif var in os.environ:
+                del os.environ[var]
 
     def test_root_endpoint(self):
         url = f"http://{self.ip}:{self.port}/"
@@ -252,6 +269,123 @@ class TestMyFlightWall(unittest.TestCase):
         data = json.loads(ctx.exception.read().decode('utf-8'))
         self.assertEqual(data["status"], "error")
         self.assertIn("MINUTES must be a positive integer", data["message"])
+
+    def test_parse_active_hours(self):
+        self.assertEqual(myflightwall.parse_active_hours("08:00,18:00"), ("08:00", "18:00"))
+        with self.assertRaises(ValueError):
+            myflightwall.parse_active_hours("08:00")
+        with self.assertRaises(ValueError):
+            myflightwall.parse_active_hours("invalid,time")
+
+    def test_is_within_active_hours(self):
+        # Window spanning 00:00 to 23:59 should always be True
+        myflightwall.ACTIVE_HOURS = ("00:00", "23:59")
+        self.assertTrue(myflightwall.is_within_active_hours())
+
+    def test_cast_to_hub_stops_discovery(self):
+        mock_browser = MagicMock()
+        mock_pychromecast.get_listed_chromecasts.return_value = ([], mock_browser)
+        myflightwall.cast_to_hub()
+        mock_pychromecast.discovery.stop_discovery.assert_called_once_with(mock_browser)
+
+    def test_send_android_push_skips_default_key(self):
+        myflightwall.PUSHOVER_USER_KEY = "your_user_key"
+        mock_requests.post.reset_mock()
+        myflightwall.send_android_push("UAL123", 10000, "IAD", "BOS", "B738")
+        mock_requests.post.assert_not_called()
+
+    def test_send_android_push_calls_api_when_key_set(self):
+        myflightwall.PUSHOVER_USER_KEY = "real_key"
+        mock_requests.post.reset_mock()
+        myflightwall.send_android_push("UAL123", 10000, "IAD", "BOS", "B738")
+        mock_requests.post.assert_called_once()
+
+    def test_get_config_file_path(self):
+        # When none is set
+        self.assertIsNone(myflightwall.get_config_file_path())
+
+        # Test FLIGHTWALL_CONFIG
+        os.environ["FLIGHTWALL_CONFIG"] = "/tmp/test1.json"
+        self.assertEqual(myflightwall.get_config_file_path(), "/tmp/test1.json")
+
+        # Precedence: FLIGHTWALL_CONFIG takes precedence over CONFIG_FILE
+        os.environ["CONFIG_FILE"] = "/tmp/test2.json"
+        self.assertEqual(myflightwall.get_config_file_path(), "/tmp/test1.json")
+
+        del os.environ["FLIGHTWALL_CONFIG"]
+        self.assertEqual(myflightwall.get_config_file_path(), "/tmp/test2.json")
+
+    def test_load_config_file_json(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({
+                "HOME_LAT": 42.1234,
+                "HOME_LON": -71.4321,
+                "RADAR_RADIUS_METERS": 8500,
+                "ACTIVE_HOURS": ["07:30", "22:15"]
+            }, f)
+            tmp_name = f.name
+        
+        try:
+            applied = myflightwall.load_config_file(tmp_name)
+            self.assertIn("HOME_LAT", applied)
+            self.assertEqual(myflightwall.HOME_LAT, 42.1234)
+            self.assertEqual(myflightwall.HOME_LON, -71.4321)
+            self.assertEqual(myflightwall.RADAR_RADIUS_METERS, 8500)
+            self.assertEqual(myflightwall.ACTIVE_HOURS, ("07:30", "22:15"))
+        finally:
+            if os.path.exists(tmp_name):
+                os.remove(tmp_name)
+
+    def test_load_config_file_ini(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
+            f.write("HOME_LAT = 41.5\n")
+            f.write("RADAR_RADIUS_METERS = 7000\n")
+            f.write("ACTIVE_HOURS = 08:00,20:00\n")
+            tmp_name = f.name
+
+        try:
+            applied = myflightwall.load_config_file(tmp_name)
+            self.assertEqual(myflightwall.HOME_LAT, 41.5)
+            self.assertEqual(myflightwall.RADAR_RADIUS_METERS, 7000)
+            self.assertEqual(myflightwall.ACTIVE_HOURS, ("08:00", "20:00"))
+        finally:
+            if os.path.exists(tmp_name):
+                os.remove(tmp_name)
+
+    def test_load_config_file_missing(self):
+        applied = myflightwall.load_config_file("/non/existent/path/for/config.json")
+        self.assertEqual(applied, {})
+
+    def test_save_config_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = os.path.join(tmp_dir, "saved_config.json")
+            myflightwall.HOME_LAT = 35.123
+            myflightwall.RADAR_RADIUS_METERS = 9000
+            success = myflightwall.save_config_file(tmp_path)
+            self.assertTrue(success)
+            self.assertTrue(os.path.isfile(tmp_path))
+
+            with open(tmp_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertEqual(saved["HOME_LAT"], 35.123)
+            self.assertEqual(saved["RADAR_RADIUS_METERS"], 9000)
+
+    def test_configure_endpoint_writes_to_config_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_file = os.path.join(tmp_dir, "test_config.json")
+            os.environ["FLIGHTWALL_CONFIG"] = config_file
+
+            # Send configure request with new parameters
+            url = f"http://{self.ip}:{self.port}/configure?RADAR_RADIUS_METERS=7700&HOME_LAT=41.1111"
+            req = urllib.request.urlopen(url)
+            self.assertEqual(req.getcode(), 200)
+
+            # Check that the config file was created/written with the new values
+            self.assertTrue(os.path.isfile(config_file))
+            with open(config_file, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertEqual(saved["RADAR_RADIUS_METERS"], 7700)
+            self.assertEqual(saved["HOME_LAT"], 41.1111)
 
 
 if __name__ == "__main__":

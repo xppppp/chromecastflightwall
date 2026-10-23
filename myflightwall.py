@@ -1,3 +1,4 @@
+import os
 import time
 import requests
 from gtts import gTTS
@@ -7,7 +8,10 @@ from staticmap import StaticMap, Line, CircleMarker
 import threading
 import http.server
 import socketserver
-from FlightRadar24 import FlightRadar24API
+try:
+    from FlightRadarAPI import FlightRadar24API
+except ImportError:
+    from FlightRadar24 import FlightRadar24API
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 import json
@@ -44,13 +48,18 @@ fr_api = FlightRadar24API()
 
 # --- CONFIGURATION PARSERS, LOCKS, & HISTORY ---
 def parse_active_hours(val):
-    """Parses a string formatted as 'HH:MM,HH:MM' into a tuple of two strings."""
-    parts = val.split(',')
-    if len(parts) == 2:
-        # validate HH:MM formats
-        datetime.strptime(parts[0].strip(), "%H:%M")
-        datetime.strptime(parts[1].strip(), "%H:%M")
-        return (parts[0].strip(), parts[1].strip())
+    """Parses a string formatted as 'HH:MM,HH:MM' or a 2-element list/tuple into a tuple of two strings."""
+    if isinstance(val, (list, tuple)) and len(val) == 2:
+        datetime.strptime(str(val[0]).strip(), "%H:%M")
+        datetime.strptime(str(val[1]).strip(), "%H:%M")
+        return (str(val[0]).strip(), str(val[1]).strip())
+    if isinstance(val, str):
+        parts = val.split(',')
+        if len(parts) == 2:
+            # validate HH:MM formats
+            datetime.strptime(parts[0].strip(), "%H:%M")
+            datetime.strptime(parts[1].strip(), "%H:%M")
+            return (parts[0].strip(), parts[1].strip())
     raise ValueError("ACTIVE_HOURS must be in the format 'HH:MM,HH:MM'")
 
 CONFIG_PARSERS = {
@@ -67,6 +76,128 @@ CONFIG_PARSERS = {
 
 data_lock = threading.Lock()
 detected_flights_history = []
+
+CONFIG_ENV_VARS = ["FLIGHTWALL_CONFIG", "FLIGHTWALL_CONFIG_FILE", "CONFIG_FILE"]
+
+def get_config_file_path():
+    """Returns the config file path specified by environment variables, or None if not set."""
+    for var in CONFIG_ENV_VARS:
+        path = os.environ.get(var)
+        if path and path.strip():
+            return os.path.expanduser(os.path.expandvars(path.strip()))
+    return None
+
+def load_config_file(config_path=None):
+    """Loads configuration from a JSON or key-value file specified by config_path or environment variables."""
+    if config_path is None:
+        config_path = get_config_file_path()
+    if not config_path:
+        return {}
+
+    config_path = os.path.expanduser(os.path.expandvars(config_path))
+    if not os.path.isfile(config_path):
+        print(f"Config file not found at: {config_path}")
+        return {}
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            if not content:
+                return {}
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                data = {}
+                for line in content.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or line.startswith(";"):
+                        continue
+                    if line.startswith("[") and line.endswith("]"):
+                        continue
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        data[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception as e:
+        print(f"Error reading config file {config_path}: {e}")
+        return {}
+
+    applied = {}
+    with data_lock:
+        for key, val in data.items():
+            if key in CONFIG_PARSERS:
+                try:
+                    parsed_val = CONFIG_PARSERS[key](val)
+                    globals()[key] = parsed_val
+                    applied[key] = parsed_val
+                except Exception as e:
+                    print(f"Error parsing {key} from config file: {e}")
+    if applied:
+        print(f"Loaded configuration from {config_path}: {list(applied.keys())}")
+    return applied
+
+def save_config_file(config_path=None):
+    """Writes the current configuration to the config file specified by config_path or environment variables."""
+    if config_path is None:
+        config_path = get_config_file_path()
+    if not config_path:
+        return False
+
+    config_path = os.path.expanduser(os.path.expandvars(config_path))
+
+    current_config = {}
+    with data_lock:
+        for key in CONFIG_PARSERS:
+            val = globals().get(key)
+            if isinstance(val, tuple):
+                val = list(val)
+            current_config[key] = val
+
+    parent_dir = os.path.dirname(config_path)
+    if parent_dir and not os.path.exists(parent_dir):
+        try:
+            os.makedirs(parent_dir, exist_ok=True)
+        except OSError as e:
+            print(f"Error creating directory {parent_dir}: {e}")
+            return False
+
+    is_ini = False
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content and not content.startswith("{"):
+                    is_ini = True
+        except Exception:
+            pass
+    elif config_path.endswith((".ini", ".conf", ".env")):
+        is_ini = True
+
+    tmp_path = f"{config_path}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            if is_ini:
+                for k, v in current_config.items():
+                    if isinstance(v, list):
+                        v_str = ",".join(str(item) for item in v)
+                    else:
+                        v_str = str(v)
+                    f.write(f"{k}={v_str}\n")
+            else:
+                json.dump(current_config, f, indent=4)
+                f.write("\n")
+        os.replace(tmp_path, config_path)
+        return True
+    except Exception as e:
+        print(f"Error writing config file {config_path}: {e}")
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        return False
+
+# Initial configuration load from file if specified by environment variable
+load_config_file()
 
 
 class FlightWallRequestHandler(http.server.SimpleHTTPRequestHandler):
@@ -147,6 +278,9 @@ class FlightWallRequestHandler(http.server.SimpleHTTPRequestHandler):
             current_config = {}
             for key in CONFIG_PARSERS:
                 current_config[key] = globals().get(key)
+
+        if updated_params:
+            save_config_file()
 
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
@@ -231,12 +365,17 @@ def start_local_server():
 
 def send_android_push(callsign, altitude, origin, dest, ac_type):
     """Sends a push notification to your phone via Pushover."""
-    requests.post("https://api.pushover.net/1/messages.json", data={
-        "token": "your_app_token",
-        "user": PUSHOVER_USER_KEY,
-        "title": "✈️ Plane Overhead!",
-        "message": f"{ac_type} ({callsign}) from {origin} to {dest} is flying overhead at {altitude} ft."
-    })
+    if not PUSHOVER_USER_KEY or PUSHOVER_USER_KEY == "your_user_key":
+        return
+    try:
+        requests.post("https://api.pushover.net/1/messages.json", data={
+            "token": "your_app_token",
+            "user": PUSHOVER_USER_KEY,
+            "title": "✈️ Plane Overhead!",
+            "message": f"{ac_type} ({callsign}) from {origin} to {dest} is flying overhead at {altitude} ft."
+        }, timeout=5)
+    except Exception as e:
+        print(f"Warning: Failed to send Pushover push notification: {e}")
 
 def get_large_font():
     """Attempts to load a standard system font to double the text size."""
@@ -262,8 +401,9 @@ def create_alert_media(callsign, plane_lat, plane_lon, altitude, origin_iata, or
     m.add_marker(CircleMarker((HOME_LON, HOME_LAT), 'red', 8))
     
     if trail and len(trail) > 1:
-        track_coords = [(pt['lng'], pt['lat']) for pt in trail]
-        m.add_line(Line(track_coords, 'blue', 4))
+        track_coords = [(pt['lng'], pt['lat']) for pt in trail if isinstance(pt, dict) and 'lng' in pt and 'lat' in pt]
+        if len(track_coords) > 1:
+            m.add_line(Line(track_coords, 'blue', 4))
         
     m.add_marker(CircleMarker((plane_lon, plane_lat), 'black', 12))
     img = m.render(zoom=10, center=[HOME_LON, HOME_LAT])
@@ -282,6 +422,7 @@ def create_alert_media(callsign, plane_lat, plane_lon, altitude, origin_iata, or
     d.rounded_rectangle([(10, 10), (850, 230)], radius=15, fill=(200, 200, 200, 128))
     
     # Format Vertical Speed
+    vspeed = vspeed or 0
     vspeed_str = f"+{vspeed}" if vspeed > 0 else str(vspeed)
     
     # Write the expanded data in Solid Black (0, 0, 0, 255)
@@ -301,26 +442,37 @@ def create_alert_media(callsign, plane_lat, plane_lon, altitude, origin_iata, or
 
 def cast_to_hub():
     """Finds the Nest Hub and casts the generated media."""
-    chromecasts, browser = pychromecast.get_listed_chromecasts(friendly_names=[HUB_NAME])
-    if not chromecasts:
-        print(f"Could not find Chromecast: {HUB_NAME}")
+    try:
+        chromecasts, browser = pychromecast.get_listed_chromecasts(friendly_names=[HUB_NAME])
+    except Exception as e:
+        print(f"Could not discover Chromecast: {e}")
         return
-    
-    cast = chromecasts[0]
-    cast.wait()
-    mc = cast.media_controller
-    
-    img_url = f"http://{LOCAL_IP}:{PORT}/alert.jpg"
-    mc.play_media(img_url, 'image/jpeg')
-    mc.block_until_active()
-    
-    time.sleep(2) # Buffer time for the image to load
-    time.sleep(CAST_DURATION_SECONDS) # Keep on screen for user-defined duration
-    cast.quit_app()
+
+    try:
+        if not chromecasts:
+            print(f"Could not find Chromecast: {HUB_NAME}")
+            return
+        
+        cast = chromecasts[0]
+        cast.wait()
+        mc = cast.media_controller
+        
+        img_url = f"http://{LOCAL_IP}:{PORT}/alert.jpg"
+        mc.play_media(img_url, 'image/jpeg')
+        mc.block_until_active()
+        
+        time.sleep(2) # Buffer time for the image to load
+        time.sleep(CAST_DURATION_SECONDS) # Keep on screen for user-defined duration
+        cast.quit_app()
+    except Exception as e:
+        print(f"Error casting to {HUB_NAME}: {e}")
+    finally:
+        pychromecast.discovery.stop_discovery(browser)
 
 # --- MAIN LOOP ---
 
 if __name__ == "__main__":
+    load_config_file()
     threading.Thread(target=start_local_server, daemon=True).start()
     print("FlightWall radar is active (Powered by FR24)...")
     
@@ -332,7 +484,7 @@ if __name__ == "__main__":
             for flight in flights:
                 if flight.id not in known_flights:
                     known_flights.add(flight.id)
-                    callsign = flight.callsign or "UNKNOWN"
+                    callsign = (flight.callsign or "").strip() or "UNKNOWN"
                     altitude = flight.altitude 
                     
                     gspeed = flight.ground_speed or 0
@@ -345,30 +497,43 @@ if __name__ == "__main__":
                         print(f"Alert suppressed for {callsign}: current time is outside active hours ({ACTIVE_HOURS[0]} - {ACTIVE_HOURS[1]}).")
                         continue
 
-                    details = fr_api.get_flight_details(flight)
+                    details = None
+                    try:
+                        details = fr_api.get_flight_details(flight)
+                    except Exception as err:
+                        print(f"Warning: Could not fetch flight details for {callsign} ({flight.id}): {err}")
                     
                     origin_iata = "UNKNOWN"
                     dest_iata = "UNKNOWN"
                     origin_name = "Unknown Location"
                     dest_name = "Unknown Location"
                     
-                    if details:
-                        if 'aircraft' in details and details['aircraft']:
-                            if 'model' in details['aircraft'] and details['aircraft']['model']:
-                                ac_type = details['aircraft']['model'].get('text', ac_type)
+                    if details and isinstance(details, dict):
+                        aircraft_info = details.get('aircraft')
+                        if aircraft_info and isinstance(aircraft_info, dict):
+                            model_info = aircraft_info.get('model')
+                            if model_info and isinstance(model_info, dict):
+                                ac_type = model_info.get('text') or ac_type
 
-                        if 'airport' in details and details['airport']:
-                            if details['airport'].get('origin'):
-                                origin_iata = details['airport']['origin']['code'].get('iata', 'UNKNOWN')
-                                raw_origin = details['airport']['origin'].get('name', 'Unknown Location')
+                        airport_info = details.get('airport')
+                        if airport_info and isinstance(airport_info, dict):
+                            origin_info = airport_info.get('origin')
+                            if origin_info and isinstance(origin_info, dict):
+                                code_info = origin_info.get('code')
+                                if code_info and isinstance(code_info, dict):
+                                    origin_iata = code_info.get('iata') or 'UNKNOWN'
+                                raw_origin = origin_info.get('name') or 'Unknown Location'
                                 origin_name = raw_origin.replace(" Airport", "").replace(" International", "")
                                 
-                            if details['airport'].get('destination'):
-                                dest_iata = details['airport']['destination']['code'].get('iata', 'UNKNOWN')
-                                raw_dest = details['airport']['destination'].get('name', 'Unknown Location')
+                            dest_info = airport_info.get('destination')
+                            if dest_info and isinstance(dest_info, dict):
+                                code_info = dest_info.get('code')
+                                if code_info and isinstance(code_info, dict):
+                                    dest_iata = code_info.get('iata') or 'UNKNOWN'
+                                raw_dest = dest_info.get('name') or 'Unknown Location'
                                 dest_name = raw_dest.replace(" Airport", "").replace(" International", "")
                             
-                    trail = details.get('trail', []) if details else []
+                    trail = details.get('trail', []) if details and isinstance(details, dict) else []
                     
                     send_android_push(callsign, altitude, origin_iata, dest_iata, ac_type)
                     create_alert_media(callsign, flight.latitude, flight.longitude, altitude, origin_iata, origin_name, dest_iata, dest_name, trail, ac_type, gspeed, vspeed)

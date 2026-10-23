@@ -39,6 +39,15 @@ Dynamically update script settings or retrieve the current configuration via GET
 * `PORT`: The local server port.
 * `HUB_NAME`: The friendly name of your Chromecast.
 
+#### 📁 Persistent Configuration File
+You can specify an external configuration file path using the `FLIGHTWALL_CONFIG` (or `CONFIG_FILE`) environment variable:
+```bash
+export FLIGHTWALL_CONFIG="/path/to/flightwall.json"
+python myflightwall.py
+```
+* **Startup:** If specified, the script reads and applies settings from this file on startup (supports JSON or key-value format).
+* **Dynamic Persistence:** When configuration changes are submitted via the `/configure` API endpoint, the script automatically writes the updated configuration back to the file.
+
 #### 📜 Detection History (`/detected`)
 Retrieve a JSON list of all flights detected in the past X minutes.
 **Example:** `http://<LOCAL_IP>:65530/detected?MINUTES=120`
@@ -58,4 +67,9 @@ Retrieve a JSON list of all flights detected in the past X minutes.
 #### Required Python Libraries
 Open your terminal and install the required dependencies:
 ```bash
+pip install -r requirements.txt
+```
+Or manually:
+```bash
 pip install requests gTTS pychromecast Pillow staticmap FlightRadarAPI
+```
