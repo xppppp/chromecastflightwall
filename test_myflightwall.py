@@ -63,6 +63,9 @@ class TestMyFlightWall(unittest.TestCase):
             if var in os.environ:
                 del os.environ[var]
 
+        mock_pychromecast.reset_mock()
+        mock_requests.reset_mock()
+
         # Start a local HTTP server on an ephemeral port (port 0) for testing
         class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             allow_reuse_address = True
@@ -287,6 +290,22 @@ class TestMyFlightWall(unittest.TestCase):
         mock_pychromecast.get_listed_chromecasts.return_value = ([], mock_browser)
         myflightwall.cast_to_hub()
         mock_pychromecast.discovery.stop_discovery.assert_called_once_with(mock_browser)
+
+    def test_cast_to_hub_disconnects_cast(self):
+        mock_browser = MagicMock()
+        mock_cast = MagicMock()
+        mock_cast.wait.side_effect = Exception("Connection reset by peer")
+        mock_pychromecast.get_listed_chromecasts.return_value = ([mock_cast], mock_browser)
+        myflightwall.cast_to_hub()
+        mock_cast.disconnect.assert_called_once_with(timeout=2)
+        mock_pychromecast.discovery.stop_discovery.assert_called_once_with(mock_browser)
+
+    def test_trigger_cast_sets_event(self):
+        myflightwall.cast_trigger_event.clear()
+        self.assertFalse(myflightwall.cast_trigger_event.is_set())
+        myflightwall.trigger_cast()
+        self.assertTrue(myflightwall.cast_trigger_event.is_set())
+        myflightwall.cast_trigger_event.clear()
 
     def test_send_android_push_skips_default_key(self):
         myflightwall.PUSHOVER_USER_KEY = "your_user_key"

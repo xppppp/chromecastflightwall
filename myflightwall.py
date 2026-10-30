@@ -96,7 +96,7 @@ def load_config_file(config_path=None):
 
     config_path = os.path.expanduser(os.path.expandvars(config_path))
     if not os.path.isfile(config_path):
-        print(f"Config file not found at: {config_path}")
+        print(f"Config file not found at: {config_path}", flush=True)
         return {}
 
     try:
@@ -118,7 +118,7 @@ def load_config_file(config_path=None):
                         k, v = line.split("=", 1)
                         data[k.strip()] = v.strip().strip('"').strip("'")
     except Exception as e:
-        print(f"Error reading config file {config_path}: {e}")
+        print(f"Error reading config file {config_path}: {e}", flush=True)
         return {}
 
     applied = {}
@@ -130,9 +130,9 @@ def load_config_file(config_path=None):
                     globals()[key] = parsed_val
                     applied[key] = parsed_val
                 except Exception as e:
-                    print(f"Error parsing {key} from config file: {e}")
+                    print(f"Error parsing {key} from config file: {e}", flush=True)
     if applied:
-        print(f"Loaded configuration from {config_path}: {list(applied.keys())}")
+        print(f"Loaded configuration from {config_path}: {list(applied.keys())}", flush=True)
     return applied
 
 def save_config_file(config_path=None):
@@ -157,7 +157,7 @@ def save_config_file(config_path=None):
         try:
             os.makedirs(parent_dir, exist_ok=True)
         except OSError as e:
-            print(f"Error creating directory {parent_dir}: {e}")
+            print(f"Error creating directory {parent_dir}: {e}", flush=True)
             return False
 
     is_ini = False
@@ -188,7 +188,7 @@ def save_config_file(config_path=None):
         os.replace(tmp_path, config_path)
         return True
     except Exception as e:
-        print(f"Error writing config file {config_path}: {e}")
+        print(f"Error writing config file {config_path}: {e}", flush=True)
         if os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
@@ -375,7 +375,7 @@ def send_android_push(callsign, altitude, origin, dest, ac_type):
             "message": f"{ac_type} ({callsign}) from {origin} to {dest} is flying overhead at {altitude} ft."
         }, timeout=5)
     except Exception as e:
-        print(f"Warning: Failed to send Pushover push notification: {e}")
+        print(f"Warning: Failed to send Pushover push notification: {e}", flush=True)
 
 def get_large_font():
     """Attempts to load a standard system font to double the text size."""
@@ -390,7 +390,7 @@ def get_large_font():
         except IOError:
             continue
             
-    print("Warning: Could not find system font for larger text. Using default.")
+    print("Warning: Could not find system font for larger text. Using default.", flush=True)
     return ImageFont.load_default()
 
 def create_alert_media(callsign, plane_lat, plane_lon, altitude, origin_iata, origin_name, dest_iata, dest_name, trail, ac_type, gspeed, vspeed):
@@ -441,40 +441,69 @@ def create_alert_media(callsign, plane_lat, plane_lon, altitude, origin_iata, or
     img.save("alert.jpg")
 
 def cast_to_hub():
-    """Finds the Nest Hub and casts the generated media."""
+    """Finds the Nest Hub and casts the generated media with strict timeouts."""
+    cast = None
+    browser = None
     try:
-        chromecasts, browser = pychromecast.get_listed_chromecasts(friendly_names=[HUB_NAME])
-    except Exception as e:
-        print(f"Could not discover Chromecast: {e}")
-        return
-
-    try:
+        chromecasts, browser = pychromecast.get_listed_chromecasts(
+            friendly_names=[HUB_NAME],
+            tries=1,
+            timeout=5,
+            retry_wait=1.0,
+            discovery_timeout=5
+        )
         if not chromecasts:
-            print(f"Could not find Chromecast: {HUB_NAME}")
+            print(f"Could not find Chromecast: {HUB_NAME}", flush=True)
             return
         
         cast = chromecasts[0]
-        cast.wait()
+        cast.wait(timeout=5)
         mc = cast.media_controller
         
         img_url = f"http://{LOCAL_IP}:{PORT}/alert.jpg"
         mc.play_media(img_url, 'image/jpeg')
-        mc.block_until_active()
+        mc.block_until_active(timeout=5)
         
         time.sleep(2) # Buffer time for the image to load
         time.sleep(CAST_DURATION_SECONDS) # Keep on screen for user-defined duration
         cast.quit_app()
     except Exception as e:
-        print(f"Error casting to {HUB_NAME}: {e}")
+        print(f"Error casting to {HUB_NAME}: {e}", flush=True)
     finally:
-        pychromecast.discovery.stop_discovery(browser)
+        if cast:
+            try:
+                cast.disconnect(timeout=2)
+            except Exception:
+                pass
+        if browser:
+            try:
+                pychromecast.discovery.stop_discovery(browser)
+            except Exception:
+                pass
+
+cast_trigger_event = threading.Event()
+
+def cast_worker_loop():
+    """Background worker that processes cast requests sequentially without blocking the radar loop."""
+    while True:
+        cast_trigger_event.wait()
+        cast_trigger_event.clear()
+        try:
+            cast_to_hub()
+        except Exception as e:
+            print(f"Unexpected error in cast worker: {e}", flush=True)
+
+def trigger_cast():
+    """Signals the background cast worker to cast the latest alert."""
+    cast_trigger_event.set()
 
 # --- MAIN LOOP ---
 
 if __name__ == "__main__":
     load_config_file()
     threading.Thread(target=start_local_server, daemon=True).start()
-    print("FlightWall radar is active (Powered by FR24)...")
+    threading.Thread(target=cast_worker_loop, daemon=True).start()
+    print("FlightWall radar is active (Powered by FR24)...", flush=True)
     
     while True:
         try:
@@ -491,17 +520,13 @@ if __name__ == "__main__":
                     vspeed = flight.vertical_speed or 0
                     ac_type = flight.aircraft_code or "Unknown Aircraft"
                     
-                    print(f"New flight detected: {callsign}")
-                    
-                    if not is_within_active_hours():
-                        print(f"Alert suppressed for {callsign}: current time is outside active hours ({ACTIVE_HOURS[0]} - {ACTIVE_HOURS[1]}).")
-                        continue
+                    print(f"New flight detected: {callsign}", flush=True)
 
                     details = None
                     try:
                         details = fr_api.get_flight_details(flight)
                     except Exception as err:
-                        print(f"Warning: Could not fetch flight details for {callsign} ({flight.id}): {err}")
+                        print(f"Warning: Could not fetch flight details for {callsign} ({flight.id}): {err}", flush=True)
                     
                     origin_iata = "UNKNOWN"
                     dest_iata = "UNKNOWN"
@@ -535,9 +560,6 @@ if __name__ == "__main__":
                             
                     trail = details.get('trail', []) if details and isinstance(details, dict) else []
                     
-                    send_android_push(callsign, altitude, origin_iata, dest_iata, ac_type)
-                    create_alert_media(callsign, flight.latitude, flight.longitude, altitude, origin_iata, origin_name, dest_iata, dest_name, trail, ac_type, gspeed, vspeed)
-                    
                     # Log the detected flight in the thread-safe history
                     detected_flight_info = {
                         "id": flight.id,
@@ -562,10 +584,16 @@ if __name__ == "__main__":
                         detected_flights_history = [f for f in detected_flights_history if f["timestamp_epoch"] >= cutoff]
                         detected_flights_history.append(detected_flight_info)
 
-                    cast_to_hub()
+                    if not is_within_active_hours():
+                        print(f"Alert suppressed for {callsign}: current time is outside active hours ({ACTIVE_HOURS[0]} - {ACTIVE_HOURS[1]}).", flush=True)
+                        continue
+
+                    send_android_push(callsign, altitude, origin_iata, dest_iata, ac_type)
+                    create_alert_media(callsign, flight.latitude, flight.longitude, altitude, origin_iata, origin_name, dest_iata, dest_name, trail, ac_type, gspeed, vspeed)
+                    trigger_cast()
             
         except Exception as e:
-            print(f"Error checking flights: {e}")
+            print(f"Error checking flights: {e}", flush=True)
             
         if len(known_flights) > 1000:
             known_flights.clear()

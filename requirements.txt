@@ -1,0 +1,6 @@
+requests
+gTTS
+pychromecast
+Pillow
+staticmap
+FlightRadarAPI
